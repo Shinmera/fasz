@@ -43,7 +43,7 @@
 (deftype tree ()
   `(simple-array (unsigned-byte 16) (304)))
 
-(defstruct (data (:constructor make-data (stream destination dict-ring)))
+(defstruct (data (:constructor make-data (stream destination &optional dict-ring)))
   (stream NIL :type fast-io:input-buffer)
   (tag 0 :type (unsigned-byte 32))
   (bitcount 0 :type (unsigned-byte 32))
@@ -60,10 +60,8 @@
   (ltree (make-array 304 :element-type '(unsigned-byte 16)) :type tree)
   (dtree (make-array 304 :element-type '(unsigned-byte 16)) :type tree))
 
-(defmacro clear-array (array start stop)
-  `(progn
-     ,@(loop for i from start below stop
-             collect `(setf (aref ,array ,i) 0))))
+(defmethod print-object ((data data) stream)
+  (print-unreadable-object (data stream :type T :identity T)))
 
 (defun build-fixed-trees (lt dt)
   (declare (type tree lt dt))
@@ -82,9 +80,8 @@
   (dotimes (i 32) (setf (aref dt (+ i 16)) i)))
 
 (defun build-tree (tr lengths num offset)
-  (let ((offs (make-array 16 :element-type '(unsigned-byte 16))))
+  (let ((offs (make-array 16 :element-type '(unsigned-byte 16) :initial-element 0)))
     (declare (dynamic-extent offs))
-    (clear-array tr 0 16)
     (dotimes (i num) (incf (aref tr (aref lengths (+ offset i)))))
     (setf (aref tr 0) 0)
     ;; Offset table for distribution sort
@@ -93,7 +90,7 @@
           do (setf (aref offs i) sum)
              (incf sum (aref tr i)))
     ;; Code->Symbol table
-    (dotimes (i num tr)
+    (dotimes (i num)
       (when (/= 0 (aref lengths (+ offset i)))
         (let* ((length (aref lengths (+ offset i)))
                (offset (aref offs length)))
@@ -102,7 +99,7 @@
 
 (defun getbit (data)
   (cond ((= 0 (data-bitcount data))
-         (setf (data-tag data) (fast-io:read8 (data-stream data)))
+         (setf (data-tag data) (fast-io:readu8 (data-stream data)))
          (setf (data-bitcount data) 7))
         (T
          (decf (data-bitcount data))))
@@ -111,20 +108,21 @@
     bit))
 
 (defun read-bits (data num base)
-  (when (/= 0 num)
-    (let ((limit (ash 1 num))
-          (mask 1)
-          (val 0))
-      (loop while (< mask limit)
-            do (setf mask (* mask 2))
-               (when (/= 0 (getbit data))
-                 (incf val mask)))
-      (+ val base))))
+  (if (= 0 num)
+      base
+      (let ((limit (ash 1 num))
+            (mask 1)
+            (val 0))
+        (loop while (< mask limit)
+              do (setf mask (* mask 2))
+                 (when (/= 0 (getbit data))
+                   (incf val mask)))
+        (+ val base))))
 
 (defun decode-symbol (data tr)
   (let ((sum 0) (cur 0) (len 0))
     (loop do (setf cur (+ (* 2 cur) (getbit data)))
-             (when (= 16 (incf len))
+             (when (<= 16 (incf len))
                (error "Bad data."))
              (incf sum (aref tr len))
              (decf cur (aref tr len))
@@ -151,8 +149,7 @@
           for sym = (decode-symbol data lt)
           for fill-value = 0
           for lbase = 3
-          do (when (< sym 0) (return-from decode-trees sym))
-             (flet ((handle-special (lbits)
+          do (flet ((handle-special (lbits)
                       (let ((length (read-bits data lbits lbase)))
                         (when (<= hlimit (+ num length)) (error "Bad data."))
                         (loop while (< 0 length)
@@ -213,49 +210,53 @@
 
 (defun inflate-uncompressed-block (data)
   (when (= 0 (data-curlen data))
-    (let* ((length (fast-io:read8 (data-stream data)))
-           (length (+ length (* 256 (fast-io:read8 (data-stream data)))))
-           (invlength (fast-io:read8 (data-stream data)))
-           (invlength (+ invlength (* 256 (fast-io:read8 (data-stream data))))))
+    (let* ((length (fast-io:readu8 (data-stream data)))
+           (length (+ length (* 256 (fast-io:readu8 (data-stream data)))))
+           (invlength (fast-io:readu8 (data-stream data)))
+           (invlength (+ invlength (* 256 (fast-io:readu8 (data-stream data))))))
       (when (/= length (logand (lognot invlength) #x0000FFFF))
         (error "Bad data."))
       (setf (data-curlen data) (+ length 1))
       (setf (data-bitcount data) 0)))
   (if (= 0 (decf (data-curlen data)))
       :done
-      (put data (fast-io:read8 (data-stream data)))))
+      (put data (fast-io:readu8 (data-stream data)))))
 
 (defun uncompress (data)
-  (loop with res = NIL
-        repeat (length (data-destination data))
-        do (when (= -1 (data-btype data))
-             (setf (data-bfinal data) (getbit data))
-             (setf (data-btype data) (read-bits data 2 0))
-             (case (data-btype data)
-               (1
-                (build-fixed-trees (data-ltree data) (data-dtree data)))
-               (2
-                (setf res (decode-trees data (data-ltree data) (data-dtree data))))))
-           (case (data-btype data)
-             (0
-              (setf res (inflate-uncompressed-block data)))
-             ((1 2)
-              (inflate-block-data data (data-ltree data) (data-dtree data)))
-             (T
-              (error "Bad data.")))
-           (when (eql res :done)
-             (when (= 0 (data-bfinal data))
-               #| FIXME, wtf |#)
-             (return :done))))
+  (let ((res ()))
+    (tagbody
+     :start
+       (when (/= -1 (data-btype data))
+         (go :current-block))
+     :next-block
+       (setf (data-bfinal data) (getbit data))
+       (setf (data-btype data) (read-bits data 2 0))
+       (case (data-btype data)
+         (1
+          (build-fixed-trees (data-ltree data) (data-dtree data)))
+         (2
+          (setf res (decode-trees data (data-ltree data) (data-dtree data)))))
+     :current-block
+       (case (data-btype data)
+         (0
+          (setf res (inflate-uncompressed-block data)))
+         ((1 2)
+          (inflate-block-data data (data-ltree data) (data-dtree data)))
+         (T
+          (error "Bad data.")))
+       (when (eql res :done)
+         (when (= 0 (data-bfinal data))
+           (go :next-block))
+         (return-from uncompress :done)))))
 
 (defun uncompress-checksum (data)
   (let ((index (data-index data))
         (res (uncompress data)))
     (case (data-checksum-type data)
       (:adler
-       (setf (data-checksum data) (adler32 dest index (data-index data) (data-checksum data))))
+       (setf (data-checksum data) (adler32 (data-destination data) index (data-index data) (data-checksum data))))
       (:crc
-       (setf (data-checksum data) (crc32 dest index (data-index data) (data-checksum data)))))
+       (setf (data-checksum data) (crc32 (data-destination data) index (data-index data) (data-checksum data)))))
     (when (eq res :done)
       (case (data-checksum-type data)
         (:adler
@@ -265,4 +266,62 @@
         (:crc
          (when (/= (logand (lognot (data-checksum data)) #xFFFFFFFF)
                    (fast-io:readu32-le (data-stream data)))
-           (error "Checksum mismatch.")))))))
+           (error "Checksum mismatch."))))
+      :done)))
+
+(defun parse-gzip-header (data)
+  (let ((stream (data-stream data)))
+    ;; Tag
+    (when (or (/= #x1F (fast-io:readu8 stream))
+              (/= #x8B (fast-io:readu8 stream)))
+      (error "Bad data. Non-GZIP file header."))
+    ;; Method
+    (when (/= 8 (fast-io:readu8 stream))
+      (error "Bad data. Compression method is not deflate."))
+    (let ((flag (fast-io:readu8 stream)))
+      (when (/= 0 (logand #xE0 flag))
+        (error "Bad data. Reserved flag bits are non-zero."))
+      (dotimes (i 6) (fast-io:readu8 stream))
+      ;; Extra data chunk
+      (when (/= 0 (logand #x04 flag))
+        (dotimes (i (fast-io:read16-be stream))
+          (fast-io:readu8 stream)))
+      ;; Name chunk
+      (when (/= 0 (logand #x08 flag))
+        (loop for read = (fast-io:readu8 stream)
+              until (= 0 read)))
+      ;; Comment chunk
+      (when (/= 0 (logand #x16 flag))
+        (loop for read = (fast-io:readu8 stream)
+              until (= 0 read)))
+      ;; Header CRC
+      (when (/= 0 (logand #x02 flag))
+        (fast-io:read16-be stream))
+      (setf (data-checksum-type data) :crc)
+      (setf (data-checksum data) #xFFFFFFFF)
+      data)))
+
+(defun parse-zlib-header (data)
+  (let* ((stream (data-stream data))
+         (cmf (fast-io:readu8 stream))
+         (flg (fast-io:readu8 stream)))
+    (when (/= 0 (mod (+ (* 256 cmf) flg) 31))
+      (error "Bad data. Zlib header checksum test failed."))
+    (when (/= 8 (logand cmf #x0F))
+      (error "Bad data. Compression method is not deflate."))
+    (when (< 7 (ash cmf -4))
+      (error "Bad data. Invalid window size."))
+    (when (/= 0 (logand flg #x20))
+      (error "Bad data. Preset dictionary."))
+    (setf (data-checksum-type data) :adler)
+    (setf (data-checksum data) 1)
+    (ash cmf -4)))
+
+(defun gunzip (source &key (if-exists :error))
+  (with-open-file (in source :element-type '(unsigned-byte 8))
+    (fast-io:with-fast-input (in-buffer NIL in)
+      (let* ((out-buffer (make-array (* 4096 8) :element-type '(unsigned-byte 8)))
+             (data (make-data in-buffer out-buffer)))
+        (parse-gzip-header data)
+        (loop until (eq :done (uncompress-checksum data)))
+        (data-index data)))))
